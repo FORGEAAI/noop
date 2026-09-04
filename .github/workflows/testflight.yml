@@ -18,6 +18,10 @@ on:
         description: "Upload only — skip the TestFlight group / tester step"
         type: boolean
         default: false
+      export_only:
+        description: "Sign and export a distribution IPA as a run artifact instead of uploading to App Store Connect (implies skip_invite)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -141,14 +145,50 @@ jobs:
             2>&1 | tee build/archive.log \
                  | { grep -E --line-buffered -i 'error|warning: .*(sign|provision|entitle)|^\*\* |signing|provisioning profile|archive succeeded' || true; }
 
+      - name: Verify HealthKit in the archived app
+        # The same four checks a reviewer would run on a Mac, executed against the archive's app bundle:
+        # signed entitlements, the embedded provisioning profile, and the usage strings. Fails the run
+        # if any is missing so a signing regression never reaches TestFlight silently.
+        run: |
+          set -euo pipefail
+          APP=$(find "$ARCHIVE_PATH/Products/Applications" -maxdepth 1 -name '*.app' -type d | head -1)
+          [ -n "$APP" ] || { echo "::error::no .app inside $ARCHIVE_PATH"; exit 1; }
+          echo "App bundle: $APP"
+          echo "::group::codesign entitlements (healthkit / app groups)"
+          ENT=$(codesign -d --entitlements :- "$APP" 2>/dev/null)
+          printf '%s
+' "$ENT" | grep -i -E 'health|application-groups' -A1 || true
+          echo "::endgroup::"
+          echo "::group::embedded.mobileprovision (healthkit)"
+          PROF=$(security cms -D -i "$APP/embedded.mobileprovision")
+          printf '%s
+' "$PROF" | grep -i -A1 'healthkit' || true
+          printf '%s
+' "$PROF" | grep -A1 -E '<key>(Name|TeamName|ExpirationDate)</key>' | grep -v -- '--' || true
+          echo "::endgroup::"
+          echo "::group::Info.plist NSHealth* usage strings"
+          plutil -p "$APP/Info.plist" | grep -i NSHealth || true
+          echo "::endgroup::"
+          fail=0
+          printf '%s' "$ENT"  | grep -q 'com.apple.developer.healthkit'  || { echo "::error::signed entitlements lack com.apple.developer.healthkit"; fail=1; }
+          printf '%s' "$PROF" | grep -q 'com.apple.developer.healthkit'  || { echo "::error::embedded provisioning profile lacks com.apple.developer.healthkit"; fail=1; }
+          plutil -p "$APP/Info.plist" | grep -q NSHealthShareUsageDescription  || { echo "::error::Info.plist lacks NSHealthShareUsageDescription"; fail=1; }
+          plutil -p "$APP/Info.plist" | grep -q NSHealthUpdateUsageDescription || { echo "::error::Info.plist lacks NSHealthUpdateUsageDescription"; fail=1; }
+          exit $fail
+
       - name: Write export options (adds teamID from secret)
         env:
           TEAM_ID: ${{ secrets.TEAM_ID }}
         run: |
           cp .github/export.plist build/export.plist
           /usr/libexec/PlistBuddy -c "Add :teamID string $TEAM_ID" build/export.plist
+          if [ "${{ inputs.export_only }}" = "true" ]; then
+            # Same App Store Connect signing, but write the IPA to build/export instead of uploading it.
+            /usr/libexec/PlistBuddy -c "Set :destination export" build/export.plist
+            echo "export_only: IPA will be attached as a run artifact, nothing is uploaded."
+          fi
 
-      - name: Export + upload to App Store Connect
+      - name: Export (+ upload to App Store Connect unless export_only)
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
@@ -163,7 +203,41 @@ jobs:
             -authenticationKeyID "$ASC_KEY_ID" \
             -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
             2>&1 | tee build/export.log
-          echo "Uploaded ${{ steps.ver.outputs.bundle_id }} ${{ steps.ver.outputs.version }} (${{ steps.ver.outputs.build }})"
+          if [ "${{ inputs.export_only }}" = "true" ]; then
+            echo "Exported ${{ steps.ver.outputs.bundle_id }} ${{ steps.ver.outputs.version }} (${{ steps.ver.outputs.build }}) to build/export"
+          else
+            echo "Uploaded ${{ steps.ver.outputs.bundle_id }} ${{ steps.ver.outputs.version }} (${{ steps.ver.outputs.build }})"
+          fi
+
+      - name: Verify HealthKit in the distribution-signed IPA
+        # Only possible when the IPA stays on disk (export_only). This is the App Store profile, i.e.
+        # exactly what App Store Connect receives on an upload run.
+        if: inputs.export_only
+        run: |
+          set -euo pipefail
+          IPA=$(find build/export -maxdepth 1 -name '*.ipa' | head -1)
+          [ -n "$IPA" ] || { echo "::error::no .ipa in build/export"; exit 1; }
+          rm -rf build/ipa && mkdir -p build/ipa && unzip -q -o "$IPA" -d build/ipa
+          APP=$(find build/ipa/Payload -maxdepth 1 -name '*.app' -type d | head -1)
+          echo "IPA: $IPA  ($(du -h "$IPA" | cut -f1))"
+          echo "--- codesign -d --entitlements :- | grep -i health"
+          codesign -d --entitlements :- "$APP" 2>/dev/null | grep -i health
+          echo "--- security cms -D -i embedded.mobileprovision | grep -i -A1 healthkit"
+          security cms -D -i "$APP/embedded.mobileprovision" | grep -i -A1 healthkit
+          echo "--- plutil -p Info.plist | grep -i NSHealth"
+          plutil -p "$APP/Info.plist" | grep -i NSHealth
+          echo "--- profile identity"
+          security cms -D -i "$APP/embedded.mobileprovision" | grep -A1 -E '<key>(Name|ExpirationDate)</key>' | grep -v -- '--'
+          codesign -dvv "$APP" 2>&1 | grep -E '^(Authority|TeamIdentifier|Identifier)=' || true
+
+      - name: Attach distribution IPA
+        if: inputs.export_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: NOOP-ios-${{ steps.ver.outputs.version }}-${{ steps.ver.outputs.build }}-ipa
+          path: build/export/*.ipa
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Show failure context
         if: failure()
@@ -195,7 +269,7 @@ jobs:
   invite:
     name: Wait for processing + invite internal tester
     needs: upload
-    if: ${{ !inputs.skip_invite }}
+    if: ${{ !inputs.skip_invite && !inputs.export_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
