@@ -28,6 +28,12 @@ settings:
     SWIFT_EMIT_LOC_STRINGS: YES
     SWIFT_STRICT_CONCURRENCY: minimal
     CODE_SIGN_STYLE: Automatic
+    # FORK (TestFlight pipeline): build under Dallas's Apple Developer team. Set here at project level
+    # so it outranks the upstream default in Config/BundleId.xcconfig (com.noopapp) and drives every
+    # derived id at once: app com.forgeaai.noop, widget com.forgeaai.noop.widgets, App Group
+    # group.com.forgeaai.noop.staging. DEVELOPMENT_TEAM still arrives via the gitignored
+    # Config/BundleIdSecrets.xcconfig, which .github/workflows/testflight.yml writes from a secret.
+    BUNDLE_ID_PREFIX: com.forgeaai
     # Single source of truth for the App Group id shared by the iOS app + its widget / Live Activity
     # extension. Referenced as $(APP_GROUP_ID) by both targets' entitlements and Info.plist, and read
     # at runtime via the AppGroupIdentifier Info.plist key (WidgetSnapshot.suiteName) so the value is
