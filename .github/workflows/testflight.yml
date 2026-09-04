@@ -156,15 +156,12 @@ jobs:
           echo "App bundle: $APP"
           echo "::group::codesign entitlements (healthkit / app groups)"
           ENT=$(codesign -d --entitlements :- "$APP" 2>/dev/null)
-          printf '%s
-' "$ENT" | grep -i -E 'health|application-groups' -A1 || true
+          printf '%s\n' "$ENT" | grep -i -E 'health|application-groups' -A1 || true
           echo "::endgroup::"
           echo "::group::embedded.mobileprovision (healthkit)"
           PROF=$(security cms -D -i "$APP/embedded.mobileprovision")
-          printf '%s
-' "$PROF" | grep -i -A1 'healthkit' || true
-          printf '%s
-' "$PROF" | grep -A1 -E '<key>(Name|TeamName|ExpirationDate)</key>' | grep -v -- '--' || true
+          printf '%s\n' "$PROF" | grep -i -A1 'healthkit' || true
+          printf '%s\n' "$PROF" | grep -A1 -E '<key>(Name|TeamName|ExpirationDate)</key>' | grep -v -- '--' || true
           echo "::endgroup::"
           echo "::group::Info.plist NSHealth* usage strings"
           plutil -p "$APP/Info.plist" | grep -i NSHealth || true
