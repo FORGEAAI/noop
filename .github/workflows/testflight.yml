@@ -1,0 +1,226 @@
+# Fork-only: build the iOS app (NOOPiOS) on a GitHub macOS runner, sign it with App Store Connect
+# cloud-managed signing, upload it to TestFlight, and invite the internal tester — no Mac involved.
+#
+# Signing: CODE_SIGN_STYLE is Automatic in project.yml. `-allowProvisioningUpdates` plus the
+# App Store Connect API key lets xcodebuild register/repair App IDs, capabilities, the App Group
+# and provisioning profiles itself, and use a cloud-managed Apple Distribution certificate for
+# the export. No .p12 / certificate secrets exist anywhere in this pipeline.
+#
+# Secrets (gh secret set …): ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (base64 of the .p8),
+# TEAM_ID, TESTER_EMAIL (optional — the address to add to the internal group).
+# Upstream's app-build.yml / fork-release.yml still build unsigned; this workflow is additive.
+name: TestFlight (fork)
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_invite:
+        description: "Upload only — skip the TestFlight group / tester step"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testflight
+  cancel-in-progress: false   # never cancel an upload mid-flight
+
+env:
+  # Pinned, stable Xcode. The app needs the iOS 26 SDK (Liquid Glass `glassEffect`), which the
+  # macos-15 image ships as Xcode 26.0.1 … 26.3 beside its 16.4 default. Bump deliberately.
+  XCODE_VERSION: "26.3"
+  SCHEME: NOOPiOS
+  ARCHIVE_PATH: build/NOOP.xcarchive
+
+jobs:
+  upload:
+    name: Archive + upload to App Store Connect
+    runs-on: macos-15
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      build: ${{ steps.ver.outputs.build }}
+      bundle_id: ${{ steps.ver.outputs.bundle_id }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check required secrets
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+        run: |
+          missing=""
+          for v in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8 TEAM_ID; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing — set them with 'gh secret set'."
+            exit 1
+          fi
+
+      - name: Select Xcode ${{ env.XCODE_VERSION }}
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Toolchain versions
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Write signing config (gitignored)
+        # Config/BundleId.xcconfig does `#include? "BundleIdSecrets.xcconfig"` — upstream's own hook for
+        # a per-developer DEVELOPMENT_TEAM. Writing it here keeps the Team ID out of the public repo.
+        env:
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+        run: printf 'DEVELOPMENT_TEAM = %s\n' "$TEAM_ID" > Config/BundleIdSecrets.xcconfig
+
+      - name: Install App Store Connect API key
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          KEY_DIR="$HOME/private_keys"
+          KEY_PATH="$KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
+          mkdir -p "$KEY_DIR"
+          printf '%s' "$ASC_KEY_P8" | base64 --decode > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          # Sanity-check the decode produced a real EC private key (prints nothing about the key).
+          openssl pkey -in "$KEY_PATH" -noout \
+            || { echo "::error::ASC_KEY_P8 did not decode to a valid .p8 private key (is it base64 of the whole file?)"; exit 1; }
+          echo "ASC_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Resolve version, build number, bundle id
+        id: ver
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 'MARKETING_VERSION:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
+          BASE=$(grep -m1 'CURRENT_PROJECT_VERSION:' project.yml | sed -E 's/.*"([0-9]+)".*/\1/')
+          # Monotonic per run so a re-run never collides with a build App Store Connect already holds.
+          BUILD=$((BASE + GITHUB_RUN_NUMBER))
+          BUNDLE_ID=$(xcodebuild -project Strand.xcodeproj -scheme "$SCHEME" -configuration Release \
+                        -showBuildSettings 2>/dev/null \
+                      | awk -F' = ' '/^ *PRODUCT_BUNDLE_IDENTIFIER = /{print $2; exit}')
+          [ -n "$BUNDLE_ID" ] || { echo "::error::could not resolve PRODUCT_BUNDLE_IDENTIFIER"; exit 1; }
+          echo "version=$VERSION"     >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD"         >> "$GITHUB_OUTPUT"
+          echo "bundle_id=$BUNDLE_ID" >> "$GITHUB_OUTPUT"
+          echo "Building $BUNDLE_ID  $VERSION ($BUILD)"
+
+      - name: Archive (automatic signing, cloud-managed)
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          BUILD: ${{ steps.ver.outputs.build }}
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          # Full log goes to build/archive.log (uploaded as an artifact); the console only gets the
+          # signal lines so a failure is readable in `gh run view --log`.
+          xcodebuild archive \
+            -project Strand.xcodeproj \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            CURRENT_PROJECT_VERSION="$BUILD" \
+            2>&1 | tee build/archive.log \
+                 | { grep -E --line-buffered -i 'error|warning: .*(sign|provision|entitle)|^\*\* |signing|provisioning profile|archive succeeded' || true; }
+
+      - name: Write export options (adds teamID from secret)
+        env:
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+        run: |
+          cp .github/export.plist build/export.plist
+          /usr/libexec/PlistBuddy -c "Add :teamID string $TEAM_ID" build/export.plist
+
+      - name: Export + upload to App Store Connect
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportOptionsPlist build/export.plist \
+            -exportPath build/export \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            2>&1 | tee build/export.log
+          echo "Uploaded ${{ steps.ver.outputs.bundle_id }} ${{ steps.ver.outputs.version }} (${{ steps.ver.outputs.build }})"
+
+      - name: Show failure context
+        if: failure()
+        run: |
+          for f in build/archive.log build/export.log; do
+            [ -f "$f" ] || continue
+            echo "::group::$f — error lines"
+            { grep -n -E 'error:|error =|ERROR|Error Domain|failed|FAIL' "$f" | grep -v 'warning:' | head -60; } || true
+            echo "::endgroup::"
+            echo "::group::$f — last 60 lines"
+            tail -60 "$f"
+            echo "::endgroup::"
+          done
+          if [ -f build/export/Packaging.log ]; then
+            echo "::group::Packaging.log"; tail -80 build/export/Packaging.log; echo "::endgroup::"
+          fi
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testflight-logs-${{ github.run_number }}
+          path: |
+            build/*.log
+            build/export/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+  invite:
+    name: Wait for processing + invite internal tester
+    needs: upload
+    if: ${{ !inputs.skip_invite }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: Tools/testflight_invite.py
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --quiet 'pyjwt[crypto]==2.10.1'
+
+      - name: Ensure internal group + tester, wait for the build
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          TESTER_EMAIL: ${{ secrets.TESTER_EMAIL }}
+        run: >-
+          python Tools/testflight_invite.py
+          --bundle-id '${{ needs.upload.outputs.bundle_id }}'
+          --version '${{ needs.upload.outputs.version }}'
+          --build '${{ needs.upload.outputs.build }}'
+          --group 'Internal'
+          --wait-minutes 60

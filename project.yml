@@ -232,6 +232,11 @@ targets:
         # Surfaces APP_GROUP_ID to runtime (WidgetSnapshot.suiteName) so the App Group id isn't
         # hard-coded in Swift; stays in sync with the application-groups entitlement (both $(APP_GROUP_ID)).
         AppGroupIdentifier: "$(APP_GROUP_ID)"
+        # App Store Connect export-compliance answer. NOOP only uses the OS-provided TLS stack (exempt
+        # encryption), so declaring this here skips the manual "Missing Compliance" prompt on every
+        # TestFlight build. Lives here, not in the .plist file, because xcodegen regenerates
+        # StrandiOS/Resources/Info.plist from these properties on every `xcodegen generate`.
+        ITSAppUsesNonExemptEncryption: false
         LSApplicationCategoryType: public.app-category.healthcare-fitness
         UILaunchScreen: {}
         # Alternate app icons (v3 "Titanium & Gold"). The primary icon stays the asset-catalog
@@ -335,11 +340,11 @@ targets:
       - package: ZIPFoundation
       - package: PolarProtocol
       - target: NOOPiOSWidgets
-      # Embed the watchOS app so the iPhone app carries it (NOOP.app/Watch/NOOPWatch.app). A watch app
-      # installs by riding inside its iOS companion; without this it would never reach a paired watch.
-      # Build-from-source delivers it for certain; sideload install of the embedded watch app under a free
-      # Apple ID is unproven (an Apple limitation), so the docs steer watch users to a source build for now.
-      - target: NOOPWatch
+      # FORK (TestFlight pipeline): the embedded watchOS app is intentionally NOT a dependency here.
+      # Upstream embeds NOOPWatch (NOOP.app/Watch/NOOPWatch.app) so a source build reaches a paired
+      # watch; this fork ships the iOS app alone through App Store Connect, and embedding the watch
+      # app would require two more App IDs (watch + complications) and their own HealthKit/App Group
+      # provisioning. Re-add `- target: NOOPWatch` here to restore the upstream behaviour.
 
   # WidgetKit + Live Activity extension — the iOS analogue of the macOS menu-bar
   # extra. Reads a tiny snapshot the app publishes into the shared App Group.
